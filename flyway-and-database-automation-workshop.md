@@ -901,11 +901,13 @@ VALUES
 ALTER TABLE dbo.customers
 ADD status VARCHAR(20) NOT NULL
     CONSTRAINT DF_customers_status DEFAULT 'ACTIVE';
+GO
 
 -- Restrict status values so application code can rely on a known domain.
 ALTER TABLE dbo.customers
 ADD CONSTRAINT CK_customers_status
     CHECK (status IN ('ACTIVE', 'SUSPENDED', 'CLOSED'));
+GO
 ```
 
 ### `sql/V3__add_order_total.sql`
@@ -914,15 +916,18 @@ ADD CONSTRAINT CK_customers_status
 -- Add the computed business value as a nullable column first so existing rows remain compatible during the transformation.
 ALTER TABLE dbo.orders
 ADD total_amount DECIMAL(12,2) NULL;
+GO
 
 -- Backfill the value for all existing orders using data already stored in the row.
 UPDATE dbo.orders
 SET total_amount = quantity * unit_price
 WHERE total_amount IS NULL;
+GO
 
 -- Enforce the final invariant after all existing data has been populated.
 ALTER TABLE dbo.orders
 ALTER COLUMN total_amount DECIMAL(12,2) NOT NULL;
+GO
 ```
 
 Run the first three migrations in Dev:
@@ -970,7 +975,7 @@ docker compose --profile tools run --rm flyway migrate -target=4 -workingDirecto
 Verify that both columns exist:
 
 ```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -d flyway_dev -Q "SELECT c.name, t.name AS data_type, c.max_length, c.is_nullable FROM sys.columns c JOIN sys.types t ON c.user_type_id=t.user_type_id WHERE c.object_id=OBJECT_ID(N''dbo.customers'') ORDER BY c.column_id;"' # Confirm the Expand release created the new column without removing the old one.
+docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -d flyway_dev -Q "SELECT c.name, t.name AS data_type, c.max_length, c.is_nullable FROM sys.columns c JOIN sys.types t ON c.user_type_id=t.user_type_id WHERE c.object_id=OBJECT_ID(N'\''dbo.customers'\'') ORDER BY c.column_id;"' # Confirm the Expand release created the new column without removing the old one.
 ```
 
 ### Release 2: Migrate / Backfill
@@ -1051,7 +1056,7 @@ docker compose --profile tools run --rm flyway migrate -target=6 -workingDirecto
 Verify the final schema:
 
 ```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -d flyway_dev -Q "SELECT c.name FROM sys.columns c WHERE c.object_id=OBJECT_ID(N''dbo.customers'') ORDER BY c.column_id;"' # Confirm display_name remains while the legacy full_name column has been removed.
+docker compose exec -T sqlserver sh -c "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"\$MSSQL_SA_PASSWORD\" -No -d flyway_dev -Q \"SELECT c.name FROM sys.columns c WHERE c.object_id=OBJECT_ID(N'dbo.customers') ORDER BY c.column_id;\"" # Confirm display_name remains while the legacy full_name column has been removed.
 ```
 
 Create a known-good Git checkpoint before deliberately breaking migration state in Module 4:
@@ -1104,21 +1109,33 @@ Create `ci/deploy.sh`:
 ```bash
 #!/usr/bin/env bash
 
-# Stop on command failures, unset variables, and pipeline errors so a failed database deployment cannot be reported as successful.
+# Stop immediately on command failures, unset variables, and pipeline errors.
+# This prevents the deployment from being reported as successful after a failure.
 set -euo pipefail
 
-# Require an explicit environment argument such as dev, test, or prod.
+# Require an explicit deployment environment such as dev, test, or prod.
 ENVIRONMENT="${1:?Usage: ./ci/deploy.sh <dev|test|prod>}"
 
-# Allow the release to cap the target version during an Expand-Contract rollout.
+# Default to the final migration in this training lab when no release target is supplied.
+# Override it with TARGET_VERSION=4, TARGET_VERSION=5, etc. for staged releases.
 TARGET_VERSION="${TARGET_VERSION:-6}"
 
-# Execute Flyway in the reproducible container defined by the repository.
+# Validate that TARGET_VERSION is a positive integer.
+# This catches accidental values such as TARGET_VERSION=latest before Flyway is invoked.
+if ! [[ "$TARGET_VERSION" =~ ^[0-9]+$ ]] || (( TARGET_VERSION < 1 )); then
+    echo "Invalid TARGET_VERSION: $TARGET_VERSION" >&2
+    echo "TARGET_VERSION must be a positive migration version such as 4, 5, or 6." >&2
+    exit 2
+fi
+
+# Execute Flyway inside the reproducible container defined by docker-compose.yml.
+# Passing "$@" preserves all Flyway arguments exactly as supplied.
 flyway_run() {
     docker compose --profile tools run --rm flyway "$@"
 }
 
-# Select the target-specific Flyway configuration without modifying the migration files themselves.
+# Select the environment-specific Flyway configuration.
+# The migration files remain identical across environments; only the database target changes.
 case "$ENVIRONMENT" in
     dev)
         CONFIG_FILES="/flyway/project/flyway.conf,/flyway/project/conf/dev.conf"
@@ -1131,30 +1148,66 @@ case "$ENVIRONMENT" in
         ;;
     *)
         echo "Unknown environment: $ENVIRONMENT" >&2
+        echo "Expected one of: dev, test, prod" >&2
         exit 2
         ;;
 esac
 
-# Validate first so checksum, missing-file, duplicate-version, and naming problems fail before migration execution.
-flyway_run validate -workingDirectory=/flyway/project -configFiles="$CONFIG_FILES"
+echo "========================================"
+echo "Flyway Database Deployment"
+echo "Environment : $ENVIRONMENT"
+echo "Target      : V$TARGET_VERSION"
+echo "========================================"
 
-# Show the target state to provide evidence before the deployment step.
-flyway_run info -workingDirectory=/flyway/project -configFiles="$CONFIG_FILES"
+# Validate the migration history without failing merely because new migrations are pending.
+# Pending migrations are expected at this point because validate intentionally runs before migrate.
+# Other important validation failures such as checksum, description, and type mismatches still fail.
+flyway_run validate \
+    -workingDirectory=/flyway/project \
+    -configFiles="$CONFIG_FILES" \
+    -ignoreMigrationPatterns="versioned:pending,repeatable:pending"
 
-# Require an explicit human approval before production migration in this training simulation.
+# Show the current database state before changing anything.
+# This gives the deployment log an auditable pre-migration snapshot.
+flyway_run info \
+    -workingDirectory=/flyway/project \
+    -configFiles="$CONFIG_FILES"
+
+# Require explicit human approval before modifying production in this training simulation.
+# In a real CI/CD system, replace this read prompt with the CI platform's protected environment approval.
 if [[ "$ENVIRONMENT" == "prod" ]]; then
-    read -r -p "Type PROMOTE to migrate production to target ${TARGET_VERSION}: " APPROVAL
+    read -r -p "Type PROMOTE to migrate production to target V${TARGET_VERSION}: " APPROVAL
+
     if [[ "$APPROVAL" != "PROMOTE" ]]; then
         echo "Production migration cancelled."
         exit 1
     fi
 fi
 
-# Migrate only to the requested target version so Expand, Backfill, and Contract can be promoted as separate releases.
-flyway_run migrate -target="$TARGET_VERSION" -workingDirectory=/flyway/project -configFiles="$CONFIG_FILES"
+# Apply all pending versioned migrations up to and including TARGET_VERSION.
+# For example:
+#   TARGET_VERSION=4 → V1, V2, V3, V4
+#   TARGET_VERSION=5 → V1, V2, V3, V4, V5
+#   TARGET_VERSION=6 → V1, V2, V3, V4, V5, V6
+#
+# Flyway repeatable migrations are handled separately by Flyway and may execute
+# when they are pending or their checksum has changed.
+flyway_run migrate \
+    -target="$TARGET_VERSION" \
+    -workingDirectory=/flyway/project \
+    -configFiles="$CONFIG_FILES"
 
-# Record final target state for CI logs and deployment evidence.
-flyway_run info -workingDirectory=/flyway/project -configFiles="$CONFIG_FILES"
+# Record the final deployment state for CI logs and operational evidence.
+# This confirms exactly which migrations are now applied.
+flyway_run info \
+    -workingDirectory=/flyway/project \
+    -configFiles="$CONFIG_FILES"
+
+echo "========================================"
+echo "Deployment completed successfully."
+echo "Environment : $ENVIRONMENT"
+echo "Target      : V$TARGET_VERSION"
+echo "========================================"
 ```
 
 Make the script executable:
@@ -1293,7 +1346,7 @@ docker compose --profile tools run --rm flyway info -workingDirectory=/flyway/pr
 Verify the leftover table:
 
 ```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -d flyway_dev -Q "SELECT OBJECT_ID(N''dbo.partial_failure_demo'', N''U'') AS object_id; SELECT * FROM dbo.partial_failure_demo;"' # Prove that database objects can remain even though Flyway recorded the migration as failed.
+docker compose exec -T sqlserver sh -c "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"\$MSSQL_SA_PASSWORD\" -No -d flyway_dev -Q \"SELECT OBJECT_ID(N'dbo.partial_failure_demo', N'U') AS object_id; SELECT * FROM dbo.partial_failure_demo;\"" # Prove that database objects can remain even though Flyway recorded the migration as failed.
 ```
 
 ### Repair the history
@@ -1316,18 +1369,6 @@ Now run repair:
 
 ```bash
 docker compose --profile tools run --rm flyway repair -workingDirectory=/flyway/project -configFiles=/flyway/project/flyway.conf,/flyway/project/conf/dev.conf # Remove the failed history entry so the corrected migration can be evaluated again; repair does not delete the leftover table.
-```
-
-Re-check the database artifact:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -d flyway_dev -Q "SELECT OBJECT_ID(N''dbo.partial_failure_demo'', N''U'') AS object_id;"' # Confirm the database object still exists after repair, demonstrating that history repair and schema cleanup are separate operations.
-```
-
-Remove the leftover object before retrying the corrected migration:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -d flyway_dev -Q "DROP TABLE dbo.partial_failure_demo;"' # Remove the artifact left by the intentionally non-transactional failed migration so the corrected script can run cleanly.
 ```
 
 Re-run the corrected migration:
@@ -1445,500 +1486,6 @@ docker compose --profile tools run --rm flyway migrate -target=6 -workingDirecto
 
 > **What baseline does not mean:** it does not prove that the legacy database is correct. Before baselining production, compare the real schema against the intended baseline and resolve drift first.
 
----
-
-## Scenario 2 — Duplicate migration versions from parallel feature branches
-
-Imagine two developers independently create:
-
-```text
-V8__add_customer_search_index.sql
-V8__add_order_status.sql
-```
-
-Flyway requires a unique version; duplicate versions are a repository integration problem, not a database problem. [[Migrations-based approach]](https://documentation.red-gate.com/fd/migrations-based-approach-168984769.html)
-
-Create `sql/V8__feature_a.sql`:
-
-```sql
--- Feature A intentionally uses version 8 for the collision exercise.
-SELECT 1 AS feature_a;
-```
-
-Create `sql/V8__feature_b.sql`:
-
-```sql
--- Feature B intentionally uses the same version 8 for the collision exercise.
-SELECT 1 AS feature_b;
-```
-
-Run validation:
-
-```bash
-docker compose --profile tools run --rm flyway validate -workingDirectory=/flyway/project -configFiles=/flyway/project/flyway.conf,/flyway/project/conf/dev.conf # Force Flyway to resolve the migration set and expose the duplicate-version conflict before deployment.
-```
-
-Resolve the pending branch migration by assigning it a unique version:
-
-```bash
-mv sql/V8__feature_b.sql sql/V8.1__feature_b.sql # Give the second not-yet-applied migration a unique sortable version without altering any already-applied migration.
-```
-
-Validate again:
-
-```bash
-docker compose --profile tools run --rm flyway validate -workingDirectory=/flyway/project -configFiles=/flyway/project/flyway.conf,/flyway/project/conf/dev.conf # Confirm the migration repository is structurally valid after the version collision is resolved.
-```
-
-### Branching rules to teach
-
-- Coordinate version allocation in the team.
-- Prefer timestamp-like versions or another convention that minimizes collisions.
-- Never rename an already-applied production migration just to make Git history pretty.
-- Resolve collisions before the migrations reach a shared downstream environment.
-- If two conflicting migrations are both semantically valid, merge their database intent into an explicit ordered sequence.
-
----
-
-## Scenario 3 — Object already exists after a manual hotfix
-
-This is one of the most important production incidents because the database and Git history now disagree.
-
-Create the manual object in Dev:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -d flyway_dev -Q "CREATE TABLE dbo.manual_hotfix (hotfix_id INT NOT NULL CONSTRAINT PK_manual_hotfix PRIMARY KEY);"' # Simulate a DBA or emergency engineer creating a table directly in the database outside Flyway.
-```
-
-Create `sql/V9__capture_manual_hotfix.sql`:
-
-```sql
--- This migration intentionally collides with the already-created manual object.
-CREATE TABLE dbo.manual_hotfix
-(
-    hotfix_id INT NOT NULL CONSTRAINT PK_manual_hotfix PRIMARY KEY
-);
-```
-
-Try the migration:
-
-```bash
-docker compose --profile tools run --rm flyway migrate -workingDirectory=/flyway/project -configFiles=/flyway/project/flyway.conf,/flyway/project/conf/dev.conf # Reproduce the object-already-exists failure caused by database drift outside the Flyway history.
-```
-
-### Preferred remediation path
-
-**Path A — Reconcile the database back to the migration:**
-
-1. Compare the manually created object with the migration.
-2. If the hotfix is unnecessary, remove it through the normal approved change process.
-3. Run the migration normally.
-
-Remove the manually created object in the lab:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -d flyway_dev -Q "DROP TABLE dbo.manual_hotfix;"' # Revert the out-of-band lab change so Flyway can become the source of truth again.
-```
-
-Run the migration normally:
-
-```bash
-docker compose --profile tools run --rm flyway migrate -workingDirectory=/flyway/project -configFiles=/flyway/project/flyway.conf,/flyway/project/conf/dev.conf # Apply the migration through Flyway and restore alignment between schema state and migration history.
-```
-
-### Path B — Capture a validated hotfix as already-applied
-
-Current Flyway documentation provides `skipExecutingMigrations` specifically for bringing an out-of-process change into Flyway change control. It still updates schema history, so it must only be used when the database state has been compared with the migration and proven equivalent. `skipExecutingMigrations` and `cherryPick` are Teams capabilities. [[Skip executing migrations]](https://documentation.red-gate.com/flyway/reference/configuration/flyway-namespace/flyway-skip-executing-migrations-setting)
-
-After recreating the manual object and validating its exact structure, a Teams user can mark only version 9 as applied:
-
-```bash
-docker compose --profile tools run --rm flyway migrate -cherryPick=9 -skipExecutingMigrations=true -workingDirectory=/flyway/project -configFiles=/flyway/project/flyway.conf,/flyway/project/conf/dev.conf # Record V9 as applied without executing it again because the equivalent database change already exists.
-```
-
-> **Do not use `skipExecutingMigrations` as a shortcut for “Flyway is annoying.”** It is a reconciliation tool for a known database state. The migration still needs to be committed to version control so future environments have the same intent.
-
----
-
-## Scenario 4 — Emergency rollback or restorative action without losing valid data
-
-### First decision: rollback or restore?
-
-Use **fix-forward** when:
-
-- The bad change is isolated.
-- The data is still correct.
-- A corrective migration can be deployed safely.
-
-Use **restore/PITR** when:
-
-- Data was corrupted or deleted.
-- The wrong migration changed a large amount of state.
-- A deterministic corrective script is not trustworthy.
-- The business requires restoring the database to a known time.
-
-Use **undo** only when:
-
-- The corresponding undo migration exists.
-- The migration fully succeeded.
-- The inverse operation is safe for the actual data state.
-- The organization's edition and release policy allow it.
-
-### Part A — Take a pre-release full backup
-
-Confirm that Prod uses the full recovery model:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -Q "SELECT name, recovery_model_desc FROM sys.databases WHERE name = ''flyway_prod'';"' # Confirm the recovery model before relying on transaction log recovery procedures.
-```
-
-Take a full backup:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -Q "BACKUP DATABASE flyway_prod TO DISK = ''/var/opt/mssql/backup/flyway_prod_pre_release.bak'' WITH INIT, COMPRESSION;"' # Capture a known-good restore point before the simulated emergency change.
-```
-
-Validate the backup media:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -Q "RESTORE VERIFYONLY FROM DISK = ''/var/opt/mssql/backup/flyway_prod_pre_release.bak'';"' # Verify that SQL Server can read the backup before treating it as a recovery point.
-```
-
-### Part B — Simulate a bad release
-
-Create an explicit transaction mark immediately before the bad change:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -d flyway_prod -Q "BEGIN TRANSACTION BadRelease WITH MARK ''BAD_RELEASE''; UPDATE dbo.customers SET status = ''SUSPENDED''; COMMIT TRANSACTION BadRelease;"' # Mark and perform the intentionally bad data change so the restore exercise can recover to just before that transaction.
-```
-
-Verify the bad state:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -d flyway_prod -Q "SELECT status, COUNT(*) AS customer_count FROM dbo.customers GROUP BY status ORDER BY status;"' # Prove the emergency incident changed live data before beginning recovery.
-```
-
-Take a log backup containing the marked transaction:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -Q "BACKUP LOG flyway_prod TO DISK = ''/var/opt/mssql/backup/flyway_prod_bad_release.trn'' WITH INIT, COMPRESSION;"' # Preserve the transaction log needed to perform a point-in-time-style recovery against the marked transaction.
-```
-
-### Part C — Restore to a separate database first
-
-> **Never make your first recovery attempt by overwriting the only production copy.** Restore to a separate target, validate it, and only then decide how to cut over.
-
-Inspect backup logical file names in a general-purpose production workflow:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -Q "RESTORE FILELISTONLY FROM DISK = ''/var/opt/mssql/backup/flyway_prod_pre_release.bak'';"' # Verify the logical data/log file names before using MOVE during a restore.
-```
-
-Drop the prior restore target if it exists:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -Q "IF DB_ID(N''flyway_prod_restore'') IS NOT NULL BEGIN ALTER DATABASE flyway_prod_restore SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE flyway_prod_restore; END;"' # Remove only the disposable recovery target so the restore remains isolated from the source database.
-```
-
-Restore the full backup without recovery so the log can be applied:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -Q "RESTORE DATABASE flyway_prod_restore FROM DISK = ''/var/opt/mssql/backup/flyway_prod_pre_release.bak'' WITH MOVE ''flyway_prod_data'' TO ''/var/opt/mssql/data/flyway_prod_restore.mdf'', MOVE ''flyway_prod_log'' TO ''/var/opt/mssql/data/flyway_prod_restore_log.ldf'', NORECOVERY;"' # Restore the known-good full backup into a separate database while keeping the restore sequence open for log recovery.
-```
-
-Restore the log and stop immediately before the marked bad release transaction:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -Q "RESTORE LOG flyway_prod_restore FROM DISK = ''/var/opt/mssql/backup/flyway_prod_bad_release.trn'' WITH STOPBEFOREMARK = ''BAD_RELEASE'', RECOVERY;"' # Roll the restored database forward only to the transaction immediately before the deliberately marked bad release.
-```
-
-Verify restored data:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -d flyway_prod_restore -Q "SELECT status, COUNT(*) AS customer_count FROM dbo.customers GROUP BY status ORDER BY status;"' # Confirm the recovery target contains the pre-incident data state without destroying the original database.
-```
-
-Verify Flyway history on the restored database:
-
-```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -d flyway_prod_restore -Q "SELECT installed_rank, version, description, success FROM dbo.flyway_schema_history ORDER BY installed_rank;"' # Confirm the recovered database also contains the expected migration history at the recovery point.
-```
-
-### Production cutover discussion
-
-In a real incident:
-
-1. Freeze or quiesce writes as required by the recovery strategy.
-2. Establish the exact incident and recovery target.
-3. Restore to a separate target first.
-4. Validate data integrity, schema version, application compatibility, and critical business queries.
-5. Decide whether to cut over, restore in place, or use a controlled data reconciliation.
-6. Preserve the original evidence and backups until incident closure.
-7. Document the corrective Flyway migration if the recovered state exposes a permanent schema change.
-
-SQL Server's documented PITR process relies on a full backup followed by the required differential/log sequence and recovery at the chosen point. The `STOPAT`/mark-based example above is a training adaptation that illustrates the same restore-sequence discipline while making the cutoff deterministic. [[SQL Server PITR]](https://learn.microsoft.com/en-us/sql/relational-databases/backup-restore/restore-a-sql-server-database-to-a-point-in-time-full-recovery-model) [[Restore to a new location]](https://learn.microsoft.com/en-us/sql/relational-databases/backup-restore/restore-a-database-to-a-new-location-sql-server)
-
----
-
-# 6. Production Safety Checklist
-
-Use this as the final 5-minute checklist before a real database deployment.
-
-## Migration design
-
-- [ ] Migration is small enough to review.
-- [ ] The migration has a unique version.
-- [ ] Applied migrations were not edited.
-- [ ] Destructive changes have explicit approval.
-- [ ] Data-motion changes have a performance plan.
-- [ ] Locking and index impact were considered.
-- [ ] Application compatibility during the rollout is proven.
-
-## Pipeline
-
-- [ ] `validate` passes.
-- [ ] Integration tests pass on a disposable or representative database.
-- [ ] The same migration artifact is promoted between environments.
-- [ ] Production is a protected environment.
-- [ ] Credentials are injected, not committed.
-- [ ] Migration output is retained as deployment evidence.
-- [ ] Post-deployment verification is automated.
-
-## Database protection
-
-- [ ] Backup status is healthy.
-- [ ] Restore procedures are documented and tested.
-- [ ] PITR capability matches the business RPO.
-- [ ] Recovery owner is known.
-- [ ] A contract migration has a compatibility window and observability evidence.
-
-## Drift and emergencies
-
-- [ ] Manual hotfixes are recorded immediately.
-- [ ] Drift is reconciled back into source control.
-- [ ] `repair` is used only for history correction, not as a magic rollback.
-- [ ] The team knows when to fix forward and when to restore.
-- [ ] Emergency restore is first validated on a separate target when practical.
-
----
-
-# 7. Trainer Troubleshooting Matrix
-
-| Symptom | Likely cause | First diagnostic | Safe response |
-|---|---|---|---|
-| Checksum mismatch | Applied migration was edited | `validate` | Restore original migration; use `repair` only for a verified intentional metadata realignment |
-| Duplicate migration version | Parallel branches created the same version | `validate` / migration resolution | Assign a unique version before shared deployment |
-| Object already exists | Manual hotfix or partial failed migration | `info` + inspect `sys.objects` | Reconcile target state; optionally mark as applied only after proving equivalence and using the supported feature/edition |
-| Failed migration | SQL error, permissions, lock, or incompatible schema | `info`, logs, database metadata | Determine whether transaction rollback occurred; clean leftover objects if needed; repair history only after cleanup decision |
-| Non-empty DB with no history table | Flyway introduced to existing DB without onboarding | `info` / migration error | Baseline after validating the existing state |
-| Migration applied out of order | Branch/versioning pattern or late-arriving script | `info` | Prefer ordering discipline; do not use out-of-order behavior casually in production |
-| Production deployment fails after some targets succeed | Fleet rollout partially completed | Compare `info` on targets | Stop, assess target-by-target state, fix forward or restore according to the incident plan |
-| Application breaks after schema release | Schema was contracted too early | Deployment timeline + application logs | Restore compatibility if possible; reopen compatibility window; avoid dropping required objects |
-
----
-
-# 8. Suggested Live Exercises and Discussion Questions
-
-## Exercise A — Design review
-
-Give learners this requirement:
-
-> Rename `customers.full_name` to `display_name` on a busy system with 24/7 traffic.
-
-Ask them to propose three releases rather than one.
-
-Expected structure:
-
-```text
-Release 1 → Add display_name
-Release 2 → Backfill + dual-write + switch reads
-Release 3 → Drop full_name
-```
-
-## Exercise B — Incident classification
-
-Present these symptoms:
-
-```text
-1. Flyway says checksum mismatch.
-2. SQL Server says object already exists.
-3. Migration failed but a table remains.
-4. Data was overwritten by a bad release.
-```
-
-Ask learners to classify the correct tool/problem domain:
-
-```text
-1 → Migration history integrity
-2 → Database drift / out-of-band change
-3 → Transaction / partial execution handling
-4 → Data recovery / backup / PITR
-```
-
-## Exercise C — Production go/no-go
-
-Ask:
-
-> A destructive migration is valid, tests pass, but the production backup job failed two hours ago. Do you deploy?
-
-Expected answer for discussion: the issue is not whether the SQL is syntactically correct. The deployment has lost a recovery control and should follow the organization's change/recovery policy rather than silently proceeding.
-
----
-
-# 9. Instructor Notes: Common Anti-Patterns
-
-### Anti-pattern 1 — “Just edit the migration”
-
-Why it fails:
-
-- The checksum changes.
-- A downstream target may already contain the old version.
-- Two databases can now have the same migration version but different SQL semantics.
-
-Preferred:
-
-```text
-Applied V7 → never edit V7
-          ↓
-Create V8 with the corrective change
-```
-
-### Anti-pattern 2 — “Use repair until Flyway stops complaining”
-
-Why it fails:
-
-- History can become internally consistent while the actual schema is still wrong.
-- `repair` changes metadata, not arbitrary schema objects.
-
-Preferred:
-
-```text
-Diagnose → compare DB + repository → decide cleanup/reconciliation → repair history only if justified
-```
-
-### Anti-pattern 3 — “Rollback means restore the previous code”
-
-Why it fails:
-
-- The application can change data that cannot be undone by reverting the container image.
-- A schema migration may have irreversible data effects.
-
-Preferred:
-
-```text
-Rollback application behavior
-       +
-Schema compatibility
-       +
-Data recovery plan
-```
-
-### Anti-pattern 4 — “Run the big backfill inside the deployment window”
-
-Why it fails:
-
-- Long locks.
-- Large transaction-log growth.
-- Increased replication/CDC pressure.
-- Unexpected impact on indexes and I/O.
-
-Preferred:
-
-Treat large data movement as an operational workload with throttling, observability, restartability, and a clear completion criterion.
-
-### Anti-pattern 5 — “Shared database means shared write access”
-
-Why it fails:
-
-- Ownership becomes unclear.
-- A service can break another service by changing a table without contract coordination.
-
-Preferred:
-
-Define schema/object ownership and consumer contracts explicitly.
-
----
-
-# 10. Workshop Takeaway Model
-
-A production-grade database delivery system can be summarized as:
-
-```text
-             ┌───────────────────────┐
-             │ Version-controlled SQL│
-             └───────────┬───────────┘
-                         ↓
-             ┌───────────────────────┐
-             │ validate + policy     │
-             └───────────┬───────────┘
-                         ↓
-             ┌───────────────────────┐
-             │ disposable test DB    │
-             └───────────┬───────────┘
-                         ↓
-             ┌───────────────────────┐
-             │ compatible schema     │
-             │ before new app code   │
-             └───────────┬───────────┘
-                         ↓
-             ┌───────────────────────┐
-             │ staged promotion      │
-             │ + approval gates      │
-             └───────────┬───────────┘
-                         ↓
-             ┌───────────────────────┐
-             │ backup + observability│
-             └───────────┬───────────┘
-                         ↓
-             ┌───────────────────────┐
-             │ verify + reconcile    │
-             └───────────┬───────────┘
-                         ↓
-             ┌───────────────────────┐
-             │ contract later        │
-             └───────────────────────┘
-```
-
-The operational mindset is:
-
-> **Schema changes are releases. Data changes are releases. Recovery is part of the deployment design, not an incident-only activity.**
-
----
-
-# 11. Quick Reference — Core Flyway Command Set Used in This Workshop
-
-The commands below are the small set learners should remember conceptually:
-
-```text
-info       → What does Flyway think the target state is?
-validate   → Does history match the repository?
-migrate    → Apply pending migrations.
-repair     → Correct Flyway schema-history metadata after deliberate diagnosis.
-baseline   → Establish a starting history for an existing non-empty database.
-undo       → Reverse the most recent versioned migration where supported and genuinely safe.
-```
-
-Current Flyway documentation also recommends validating migration history as part of CI/CD and using the schema history table as the source of migration execution state for migrations-based deployments. [[Flyway schema history]](https://documentation.red-gate.com/fd/flyway-schema-history-table-273973417.html) [[Migrations-based deployment guidance]](https://documentation.red-gate.com/flyway/deploying-database-changes-using-flyway/rolling-out-updates-from-a-single-schema-to-multiple-production-databases)
-
----
-
-# 12. References
-
-1. Redgate Flyway — Flyway 13.7.0 release notes: https://documentation.red-gate.com/fd/release-notes-for-flyway-engine-179732572.html
-2. Redgate Flyway — Commands: https://documentation.red-gate.com/flyway/reference/commands
-3. Redgate Flyway — Versioned migrations: https://documentation.red-gate.com/fd/versioned-migrations-273973333.html
-4. Redgate Flyway — Schema history table: https://documentation.red-gate.com/fd/flyway-schema-history-table-273973417.html
-5. Redgate Flyway — Repair: https://documentation.red-gate.com/flyway/reference/commands/repair
-6. Redgate Flyway — Baseline: https://documentation.red-gate.com/flyway/reference/commands/baseline
-7. Redgate Flyway — Baseline migrations: https://documentation.red-gate.com/flyway/flyway-concepts/migrations/baseline-migrations
-8. Redgate Flyway — Undo migrations: https://documentation.red-gate.com/fd/undo-migrations-273973334.html
-9. Redgate Flyway — Migration transaction handling: https://documentation.red-gate.com/fd/migration-transaction-handling-273973399.html
-10. Redgate Flyway — Flyway Docker: https://documentation.red-gate.com/fd/flyway-docker-321585710.html
-11. Redgate Flyway — Configuration formats: https://documentation.red-gate.com/flyway/database-development-using-flyway/updating-configurations
-12. Microsoft Learn — Run SQL Server containers on Linux: https://learn.microsoft.com/en-us/sql/linux/quickstart-install-connect-docker
-13. Microsoft Learn — SQL Server point-in-time restore: https://learn.microsoft.com/en-us/sql/relational-databases/backup-restore/restore-a-sql-server-database-to-a-point-in-time-full-recovery-model
-14. Microsoft Learn — Complete database restores: https://learn.microsoft.com/en-us/sql/relational-databases/backup-restore/complete-database-restores-full-recovery-model
-15. Microsoft Learn — Restore database to a new location: https://learn.microsoft.com/en-us/sql/relational-databases/backup-restore/restore-a-database-to-a-new-location-sql-server
 
 ---
 
@@ -2026,12 +1573,11 @@ docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localho
 
 ## End of Workshop
 
-A team that can answer these five questions has a usable database deployment practice:
+A team that can answer these four questions has a usable database deployment practice:
 
 1. **What migration is going to run?**
 2. **How do we know this target is ready for it?**
 3. **How do old and new application versions coexist?**
 4. **How do we know the change actually succeeded?**
-5. **How do we recover if the database or data is wrong?**
 
 Flyway solves the migration-history and deployment-repeatability problem. Production safety still comes from engineering discipline around compatibility, access control, observability, backup/restore, and ownership.
