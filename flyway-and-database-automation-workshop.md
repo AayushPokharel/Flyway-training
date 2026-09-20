@@ -759,7 +759,7 @@ docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localho
 List the created databases:
 
 ```bash
-docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -Q "SELECT name, state_desc, recovery_model_desc FROM sys.databases WHERE name LIKE ''flyway_%'' ORDER BY name;"' # Verify the lab databases exist and confirm the recovery model used for the production restore exercises.
+docker compose exec -T sqlserver sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -No -Q "SELECT name, state_desc, recovery_model_desc FROM sys.databases WHERE name LIKE '\''flyway_%'\'' ORDER BY name;"' # Verify the lab databases exist and confirm the recovery model used for the production restore exercises.
 ```
 
 ## 4.8 Configure Flyway
