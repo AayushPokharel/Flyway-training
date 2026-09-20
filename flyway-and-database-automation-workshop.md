@@ -1392,7 +1392,7 @@ CREATE TABLE dbo.checksum_demo
 Apply V8 first:
 
 ```bash
-docker compose --profile tools run --rm flyway migrate -target=7 -workingDirectory=/flyway/project -configFiles=/flyway/project/flyway.conf,/flyway/project/conf/dev.conf # Record the original V8 checksum in the schema history so the later file edit can be detected.
+docker compose --profile tools run --rm flyway migrate -target=8 -workingDirectory=/flyway/project -configFiles=/flyway/project/flyway.conf,/flyway/project/conf/dev.conf # Record the original V8 checksum in the schema history so the later file edit can be detected.
 ```
 
 Intentionally change only a comment in the already-applied migration:
