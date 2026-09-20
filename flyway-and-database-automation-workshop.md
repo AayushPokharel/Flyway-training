@@ -1307,7 +1307,7 @@ Use the same five questions for almost every database incident:
 
 ### Part A: Reproduce a partial failure
 
-Create `sql/V99__simulate_partial_failure.sql`:
+Create `sql/V7__simulate_partial_failure.sql`:
 
 ```sql
 -- Create an object first so the training scenario leaves a visible database artifact when execution is non-transactional.
@@ -1324,7 +1324,7 @@ VALUES (1);
 THIS_IS_NOT_VALID_SQL;
 ```
 
-Create the companion script configuration file `sql/V99__simulate_partial_failure.sql.conf`:
+Create the companion script configuration file `sql/V7__simulate_partial_failure.sql.conf`:
 
 ```properties
 # Intentionally execute without one wrapping migration transaction so the lab can demonstrate leftover objects after a failure.
@@ -1340,7 +1340,7 @@ docker compose --profile tools run --rm flyway migrate -workingDirectory=/flyway
 Inspect the migration state:
 
 ```bash
-docker compose --profile tools run --rm flyway info -workingDirectory=/flyway/project -configFiles=/flyway/project/flyway.conf,/flyway/project/conf/dev.conf # Identify the failed V99 entry and compare it with the actual database state.
+docker compose --profile tools run --rm flyway info -workingDirectory=/flyway/project -configFiles=/flyway/project/flyway.conf,/flyway/project/conf/dev.conf # Identify the failed V7 entry and compare it with the actual database state.
 ```
 
 Verify the leftover table:
@@ -1351,7 +1351,7 @@ docker compose exec -T sqlserver sh -c "/opt/mssql-tools18/bin/sqlcmd -S localho
 
 ### Repair the history
 
-First remove the bad SQL from `V99__simulate_partial_failure.sql` so the intended migration is clear:
+First remove the bad SQL from `V7__simulate_partial_failure.sql` so the intended migration is clear:
 
 ```sql
 -- Keep only the intended object definition after the failed experiment is diagnosed.
@@ -1379,7 +1379,7 @@ docker compose --profile tools run --rm flyway migrate -workingDirectory=/flyway
 
 ### Part B: Reproduce a checksum mismatch
 
-Create `sql/V7__checksum_demo.sql` so the checksum exercise does not alter one of the core V1-V6 workshop migrations:
+Create `sql/V8__checksum_demo.sql` so the checksum exercise does not alter one of the core V1-V6 workshop migrations:
 
 ```sql
 -- Create a disposable training object whose migration checksum can be changed safely during this exercise.
@@ -1389,16 +1389,16 @@ CREATE TABLE dbo.checksum_demo
 );
 ```
 
-Apply V7 first:
+Apply V8 first:
 
 ```bash
-docker compose --profile tools run --rm flyway migrate -target=7 -workingDirectory=/flyway/project -configFiles=/flyway/project/flyway.conf,/flyway/project/conf/dev.conf # Record the original V7 checksum in the schema history so the later file edit can be detected.
+docker compose --profile tools run --rm flyway migrate -target=7 -workingDirectory=/flyway/project -configFiles=/flyway/project/flyway.conf,/flyway/project/conf/dev.conf # Record the original V8 checksum in the schema history so the later file edit can be detected.
 ```
 
 Intentionally change only a comment in the already-applied migration:
 
 ```bash
-printf '\n-- Training-only non-functional change used to demonstrate checksum handling.\n' >> sql/V7__checksum_demo.sql # Change the migration file without changing database semantics so Flyway has a checksum difference to detect.
+printf '\n-- Training-only non-functional change used to demonstrate checksum handling.\n' >> sql/V8__checksum_demo.sql # Change the migration file without changing database semantics so Flyway has a checksum difference to detect.
 ```
 
 Run validation:
